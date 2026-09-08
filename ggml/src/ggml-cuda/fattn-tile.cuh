@@ -900,6 +900,33 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
                     }
                 }
 
+                // Masked KV rows have P == +0.0 for every query column this warp
+                // accumulates. On gfx11 the packed v_dot2_f32_bf16 PV instruction
+                // accumulates +0.0 x V inexactly, leaking the content of a masked
+                // (e.g. freed) KV cell into VKQ. Zero this warp's own V register
+                // copies for those rows so the products are +0.0 x +0.0; other
+                // warps' columns keep their own (live) V copies.
+                bool row_dead0 = true;
+                bool row_dead1 = true;
+#pragma unroll
+                for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
+                    const nv_bfloat162 p = KQ_k[jc_VKQ_0];
+                    if (__bfloat162float(p.x) != 0.0f) { row_dead0 = false; }
+                    if (__bfloat162float(p.y) != 0.0f) { row_dead1 = false; }
+                }
+                if (row_dead0) {
+#pragma unroll
+                    for (int i0 = 0; i0 < (DVp/2)/warp_size; ++i0) {
+                        V_k0[i0] = ggml_cuda_cast<nv_bfloat162>(make_float2(0.0f, 0.0f));
+                    }
+                }
+                if (row_dead1) {
+#pragma unroll
+                    for (int i0 = 0; i0 < (DVp/2)/warp_size; ++i0) {
+                        V_k1[i0] = ggml_cuda_cast<nv_bfloat162>(make_float2(0.0f, 0.0f));
+                    }
+                }
+
 #pragma unroll
                 for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
                     const nv_bfloat162 v_perm0 = ggml_cuda_bf16_perm_ll(V_k0[i0/warp_size], V_k1[i0/warp_size]);
