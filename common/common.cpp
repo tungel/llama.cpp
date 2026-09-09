@@ -1434,6 +1434,79 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    // --spec-draft-n-max is capped at 15 (a clamp, not an error).  There are two independent
+    // bounds, and they have different severities:
+    //
+    // 1. correctness - recurrent rollback coverage.  A verify batch decodes n_max + 1 query rows
+    //    and a partial accept rolls the recurrent (chunked-GDN) state back into that same batch.
+    //    The sequential GDN kernel writes n_rs_seq + 1 = n_max + 1 rollback snapshots, and the
+    //    whole-batch chunked kernel threshold is floored at max(K, 16, n_rs_batch) with
+    //    n_rs_batch = n_max + 1, so every verify batch runs the sequential kernel and restores
+    //    snapshots it wrote.  The "16" in that floor is the constant the K-independent chunked
+    //    path was built around (K <= 16, i.e. n_max <= 15); a deeper draft makes K the active
+    //    floor and re-introduces the K-dependent prefill/verify boundary.  This bound is hard,
+    //    which is why the clamp stays at 15.  (test-rs-depth, the deterministic snapshot sweep,
+    //    is green for n_rs_seq 1..15 on qwen35 / dsv4 / kimi-k3 / qwen4exp, including deep
+    //    drafts n_tokens = n_rs_batch > K.)
+    //
+    // 2. greedy purity - kernel-family switches at 8 rows.  A verify wider than 8 rows changes
+    //    kernel family in more than one place: the HIP FA chooser switches from the tile kernel
+    //    to the MMA/WMMA kernel above 8 query rows (ggml/src/ggml-cuda/fattn.cu, the Q->ne[1] > 8
+    //    switch), and the matmuls switch from the MMVQ/MMVF families (ncols <= MMVQ_MAX_BATCH_SIZE
+    //    = 8) to MMQ.  None of these families is bit-identical to the W=1 kernel, so a verify of
+    //    more than 8 rows can disagree with a W=1 decode on a greedy near-tie (measured 2026-09-13:
+    //    27B UD-Q4_K_XL, W=1..8 one logits hash and W=9..16 another, with FA disabled too, so it is
+    //    not only the FA chooser).  This is a trade, not a correctness bound: depth 8..15 keeps the
+    //    throughput win (measured 2026-09-13: 27B UD-Q4_K_XL recall n_max 15 = 116 t/s vs 71 at
+    //    n_max 7) and only risks a near-tie flip, so it is allowed with a prominent notice.
+    //    qwen4exp also had its own QSA decode arm flip at W > 8 (dense below, sparse above) on top
+    //    of these; the arm is now band-matched to the verify width (src/models/qwen4exp.cpp), so
+    //    that larger dense-vs-sparse divergence is gone and only the kernel-family near-ties remain.
+    //
+    // The clamp lives here rather than in the argument parser so the notice is above the default
+    // log threshold and the user actually sees it (a warning emitted while parsing is hidden
+    // without --log-verbosity, as llama.cpp's own DEPRECATED notices are).  It runs before the
+    // model/context are created, so both see the capped depth.  See GREEDY-PURITY.md 11 and 19.
+    //
+    // LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 opts out for experiments: the depth is then honoured as given
+    // (with a warning).
+    if (params.speculative.draft.n_max > 7) {
+        static const bool clamp_enabled = []() {
+            const char * env = getenv("LLAMA_SPEC_DRAFT_N_MAX_CLAMP");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        if (params.speculative.draft.n_max > 15) {
+            if (clamp_enabled) {
+                // ERR, not WRN, on purpose: llama-cli's default verbosity hides W-level messages,
+                // and the user must learn that their setting was not honoured.  A notice, not a
+                // failure - the run continues (same pattern as common_fit_params' abort notice).
+                LOG_ERR("--spec-draft-n-max %d exceeds the maximum of 15; clamping to 15 (a deeper "
+                        "verify batch is no longer covered by the recurrent rollback snapshot "
+                        "set).  Set LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 to keep %d if you accept that "
+                        "risk.  Not an error: the run continues.\n",
+                        params.speculative.draft.n_max, params.speculative.draft.n_max);
+                params.speculative.draft.n_max = 15;
+            } else {
+                LOG_ERR("--spec-draft-n-max %d is above the supported maximum of 15 and "
+                        "LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 is set: keeping it.  A verify batch deeper "
+                        "than the recurrent snapshot set is not guaranteed to restore a correctly "
+                        "decoded boundary.  Not an error: the run continues.\n",
+                        params.speculative.draft.n_max);
+            }
+        }
+        if (params.speculative.draft.n_max > 7) {
+            // ERR, not WRN, on purpose: the default verbosity hides W-level messages and the user
+            // must learn that greedy output may differ between --spec-type none and draft-mtp.
+            LOG_ERR("--spec-draft-n-max %d is above 7: drafts this deep are supported, but a verify "
+                    "batch of more than 8 rows takes different flash-attention and matmul kernels, "
+                    "so --spec-type none and draft-mtp may no longer produce identical greedy output "
+                    "(a near-tie can flip).  The output stays valid and coherent; use "
+                    "--spec-draft-n-max 7 for bit-identical plain-vs-draft output.  "
+                    "Not an error: the run continues.\n",
+                    params.speculative.draft.n_max);
+        }
+    }
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
@@ -1711,7 +1784,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    mparams.load_mtp                    = params.speculative.has_mtp();
 
     return mparams;
 }
