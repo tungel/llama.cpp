@@ -39,7 +39,15 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        // V3 derived kq mask (ggml_flash_attn_ext_add_kq_derived): all three are nullptr unless the
+        // mask tensor is absent and each cell's value is derived from its position instead.
+        const int  * __restrict__ cell_pos, const int  * __restrict__ tok_lo, const int  * __restrict__ tok_hi,
+        // Native (non-F16-staged) K/V operands: the fattn_kv_native_type of each, i.e.
+        // FATTN_KV_NATIVE_NONE when the launcher staged an F16 copy and FATTN_KV_NATIVE_Q8_0/BF16 when
+        // the kernel reads the raw cache itself (V4 / the block-15 amendment).  Always NONE for the
+        // tile and vec kernels, which stage whichever type they were compiled for.
+        const int kv_native_K, const int kv_native_V);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -82,6 +90,177 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     }
 
     return data;
+}
+
+// -------------------------------------------------------------------------------------------------
+// V4: native q8_0 K/V in the flash-attention kernels.
+//
+// With a quantized KV cache the MMA/TILE kernels used to read an F16 copy of the *whole* cache that
+// the launcher staged into a scratch region appended to the FA node (see get_f16_extra_data above),
+// i.e. up to ~800 MiB per GPU at a 200k context.  The kernels can instead dequantize while staging
+// K/V into their shared-memory tiles: a 16-byte half2 chunk covers exactly GGML_CUDA_FA_Q8_CHUNK (8)
+// elements, a quarter of a q8_0 block.  The staged values are bit-identical to the ones the F16
+// scratch holds: convert.cu's dequantize_block_q8_0_f16 (the contiguous conversion the launcher
+// uses) computes a single F16 rounding of the exact int8 * F16-scale product, which is exactly what
+// ggml_cuda_fattn_dequantize_q8_0_chunk() below computes.
+//
+// The F16 scratch (and its per-ubatch global conversion pass) is only skipped when the launcher and
+// ggml_cuda_flash_attn_ext_get_alloc_size agree, and both ask the predicates below, so they cannot
+// disagree.  Everything else (other quantized types, mixed K/V types, tile layouts the kernels
+// cannot chunk, builds without fast FP16) keeps the existing conversion.
+
+static constexpr int GGML_CUDA_FA_Q8_CHUNK = 8; // elements staged per 16-byte shared-memory chunk
+
+// OPT-IN (default off): V4 removes the F16 K/V staging scratch (up to ~750 MiB per GPU at a 200k
+// context with a q8_0 KV cache) but costs ~1.7 % prefill, because the staged tiles are dequantized
+// synchronously (a quantized source cannot use cp_async) while the F16 staging copy it replaces is
+// built once per ubatch with an asynchronous pipeline.  Decode and verify are unaffected.  Enable
+// with GGML_CUDA_FA_KV_NATIVE=1 when the memory matters more than the last ~1.7 % of prefill.  The
+// same switch enables the bf16 arm (block 15, below): one switch for the whole "stage K/V natively
+// instead of through the F16 scratch" idea.
+static inline bool ggml_cuda_fattn_kv_native_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_FA_KV_NATIVE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// `t` is the K or V operand of a FLASH_ATTN_EXT node.
+static inline bool ggml_cuda_fattn_kv_native_supported(const ggml_tensor * t) {
+#ifdef FAST_FP16_AVAILABLE
+    if (!ggml_cuda_fattn_kv_native_enabled()) {
+        return false;
+    }
+    if (t == nullptr || t->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    // Rows are block-contiguous and every staged chunk starts at a multiple of GGML_CUDA_FA_Q8_CHUNK
+    // elements, so a chunk never straddles two q8_0 blocks (the kernel-side chunking is checked by
+    // the static_asserts in the loaders).
+    if (t->ne[0] % GGML_CUDA_FA_Q8_CHUNK != 0) {
+        return false;
+    }
+    if (t->nb[0] != (size_t) ggml_type_size(GGML_TYPE_Q8_0)) {
+        return false;
+    }
+    return true;
+#else
+    GGML_UNUSED(t);
+    return false;
+#endif // FAST_FP16_AVAILABLE
+}
+
+// The tile kernel has a single K/V type parameter, so it needs both operands to qualify.
+static inline bool ggml_cuda_fattn_tile_kv_native(const ggml_tensor * K, const ggml_tensor * V) {
+    return ggml_cuda_fattn_kv_native_supported(K) && ggml_cuda_fattn_kv_native_supported(V);
+}
+
+// -------------------------------------------------------------------------------------------------
+// Block-15 amendment: native bf16 K/V in the MMA flash-attention kernel.
+//
+// bf16 was the one KV type that still paid the whole F16 staging cost (~712 MiB per GPU at a 200k
+// context, ub 2048): the tile and vec kernels read bf16 natively (block 03) but the MMA kernel did
+// not, so the launcher staged an F16 copy of the whole cache.  Unlike q8_0 (V4) there is nothing to
+// dequantize: a bf16 row and the F16 tile it feeds have exactly the same byte layout (2 bytes per
+// element, 16-byte chunks), so the kernel only has to convert each staged chunk in registers
+// (bf16 -> f32 -> f16).  That is bit-identical to the launcher's own conversion
+// (ggml_get_to_fp16_cuda(GGML_TYPE_BF16) is ggml_cuda_cast<half>(nv_bfloat16), the same rounding), so
+// the arithmetic does not change and only the node's scratch disappears.
+//
+// OPT-IN (default off, enabled by the same GGML_CUDA_FA_KV_NATIVE=1 switch as V4's q8_0 arm - one
+// switch for the whole "stage K/V natively instead of through the F16 scratch" idea): a bf16 K/V
+// cache no longer needs the F16 staging scratch, so it costs exactly what an F16 cache costs
+// (measured: 4B 2048 968.9 -> 256.9 MiB, 27B 1072.9 -> 488.9, gemma-4-E4B 1062.9 -> 404.9,
+// gemma-4-31B 2068.9 -> 716.9 at ctx 204800).  The conversion itself is free - native bf16 staging
+// measures within 0.2 % of an F16 cache - but dropping the scratch costs ~0.8-2.4 % prefill, growing
+// with the prompt length: the launcher's F16 staging copy is a *dense, normalized* copy of the cache
+// view (nb[1] is 4x the row size for a 4-KV-head model, because the GQA heads are interleaved), and
+// the FA nodes then stage from it, whereas the native path re-reads the interleaved view on every
+// staging pass.  Same trade-off and same decision as V4 (see the block-15 notes in patches/README.md);
+// decode is unaffected (~0.1 %).
+//
+// `t` is the K or V operand of a FLASH_ATTN_EXT node.
+static inline bool ggml_cuda_fattn_kv_bf16_supported(const ggml_tensor * t) {
+#ifdef FAST_FP16_AVAILABLE
+    if (!ggml_cuda_fattn_kv_native_enabled()) {
+        return false;
+    }
+    if (t == nullptr || t->type != GGML_TYPE_BF16) {
+        return false;
+    }
+    // The staged chunk is 16 bytes, i.e. GGML_CUDA_FA_Q8_CHUNK 2-byte elements (the same chunk unit
+    // as the q8_0 arm: both K/V element types are 2 bytes wide), and rows must be contiguous.
+    if (t->ne[0] % GGML_CUDA_FA_Q8_CHUNK != 0) {
+        return false;
+    }
+    if (t->nb[0] != (size_t) ggml_type_size(GGML_TYPE_BF16)) {
+        return false;
+    }
+    return true;
+#else
+    GGML_UNUSED(t);
+    return false;
+#endif // FAST_FP16_AVAILABLE
+}
+
+// The staging source of one K/V operand, as the launcher and the kernel agree on it: either the
+// launcher staged an F16 copy in the node's scratch, or the kernel reads the raw cache itself.
+enum fattn_kv_native_type : int {
+    FATTN_KV_NATIVE_NONE = 0, // F16-staged data (the usual path)
+    FATTN_KV_NATIVE_Q8_0 = 1, // raw q8_0 rows, dequantized while staging the tiles (V4, opt-in)
+    FATTN_KV_NATIVE_BF16 = 2, // raw bf16 rows, converted to F16 while staging the tiles (block 15)
+};
+
+// The native type the MMA kernel may use for `t` (FATTN_KV_NATIVE_NONE means the F16 staging stays).
+// The launcher, ggml_cuda_flash_attn_ext_get_alloc_size and ggml_cuda_flash_attn_ext_get_f16_extra_data
+// all ask this, so they cannot disagree on whether the scratch exists.
+static inline int ggml_cuda_fattn_kv_native_type(const ggml_tensor * t) {
+    if (ggml_cuda_fattn_kv_native_supported(t)) {
+        return FATTN_KV_NATIVE_Q8_0;
+    }
+    if (ggml_cuda_fattn_kv_bf16_supported(t)) {
+        return FATTN_KV_NATIVE_BF16;
+    }
+    return FATTN_KV_NATIVE_NONE;
+}
+
+// Byte-addressed K/V rows for a native (non-F16-staged) operand.  The tile staging is unchanged
+// (F16 half2 tiles); only the source of the staged values differs.  `type_K`/`type_V` is
+// FATTN_KV_NATIVE_NONE when the operand is not native, i.e. the usual F16 conversion/scratch path.
+struct fattn_kv_native_t {
+    const char * K; // row-0 base of the K/V head (sequence/head offsets already applied)
+    const char * V;
+    int stride_K;   // bytes per KV cell
+    int stride_V;
+    int type_K;     // fattn_kv_native_type
+    int type_V;
+};
+
+// Dequantize the GGML_CUDA_FA_Q8_CHUNK elements starting at element `el` of a q8_0 row into
+// GGML_CUDA_FA_Q8_CHUNK/2 half2.  `el` must be a multiple of GGML_CUDA_FA_Q8_CHUNK so the chunk
+// never straddles two blocks.  Same arithmetic as convert.cu's dequantize_block_q8_0_f16.
+static __device__ __forceinline__ void ggml_cuda_fattn_dequantize_q8_0_chunk(
+        const char * const __restrict__ row, const int el, half2 * const __restrict__ dst) {
+    static_assert(sizeof(block_q8_0) == QK8_0 + 2, "bad block_q8_0");
+
+    const int blk = el / QK8_0;
+    const int off = el % QK8_0;
+    const char * bp = row + (size_t) blk*sizeof(block_q8_0);
+
+    // The block base is 2-byte aligned (the q8_0 block is 34 bytes and the rows are 16-byte
+    // aligned), so the scale and the 8 quants can be fetched with 2-byte accesses.
+    half d;
+    ggml_cuda_memcpy_1<sizeof(half), 2>(&d, bp);
+    const half2 d2 = __half2half2(d);
+
+    int8_t q[GGML_CUDA_FA_Q8_CHUNK];
+    ggml_cuda_memcpy_1<GGML_CUDA_FA_Q8_CHUNK, 2>(q, bp + sizeof(half) + off);
+
+#pragma unroll
+    for (int l = 0; l < GGML_CUDA_FA_Q8_CHUNK/2; ++l) {
+        dst[l] = d2 * make_half2(q[2*l + 0], q[2*l + 1]);
+    }
 }
 
 template <int D, int nthreads>
@@ -1078,6 +1257,11 @@ void launch_fattn(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
+    // V3 derived kq mask: present instead of the mask tensor above.
+    const ggml_tensor * cell_pos = dst->src[5];
+    const ggml_tensor * tok_lo   = dst->src[6];
+    const ggml_tensor * tok_hi   = dst->src[7];
+
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
@@ -1095,8 +1279,19 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
+    // V4 / block 15: the MMA kernel can read a q8_0 (dequantize) or bf16 (convert) K/V cache while
+    // staging its tiles, in which case the F16 staging copy (and the whole-cache conversion pass) is
+    // skipped for that operand.  The predicates are shared with
+    // ggml_cuda_flash_attn_ext_get_alloc_size, which sizes the node's scratch, so the two cannot
+    // disagree on whether the scratch exists.
+    const int  kv_native_K  = need_f16_K ? ggml_cuda_fattn_kv_native_type(K) : FATTN_KV_NATIVE_NONE;
+    const int  kv_native_V  = !need_f16_V ? FATTN_KV_NATIVE_NONE :
+        (V_is_K_view ? kv_native_K : ggml_cuda_fattn_kv_native_type(V));
+    const bool use_native_K = kv_native_K != FATTN_KV_NATIVE_NONE;
+    const bool use_native_V = kv_native_V != FATTN_KV_NATIVE_NONE;
+
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K && !use_native_K, need_f16_V && !use_native_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
@@ -1112,7 +1307,7 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    if (need_f16_K && K->type != GGML_TYPE_F16 && !use_native_K) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
@@ -1140,7 +1335,7 @@ void launch_fattn(
         K_data = (char *) K_f16;
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (need_f16_V && V->type != GGML_TYPE_F16 && !use_native_V) {
         if (V_is_K_view) {
             V_data = K_data;
             nb21   = nb11;
@@ -1342,7 +1537,11 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        cell_pos ? (const int *) cell_pos->data : nullptr,
+        tok_lo   ? (const int *) tok_lo  ->data : nullptr,
+        tok_hi   ? (const int *) tok_hi  ->data : nullptr,
+        kv_native_K, kv_native_V
     );
     CUDA_CHECK(cudaGetLastError());
 

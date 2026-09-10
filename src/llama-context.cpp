@@ -36,6 +36,18 @@ struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
     uint32_t n_tokens_per_seq;
+
+    // number of sequences to reserve the probe graph with (0 = the context's n_seq_max)
+    uint32_t n_seqs = 0;
+
+    // the fused node has to land on a GPU device (used by features that only make sense on a GPU)
+    bool require_gpu = false;
+
+    // ... and specifically on a backend that implements the derived kq mask (CUDA/HIP)
+    bool require_kq_derived = false;
+
+    // the probe graph has to actually contain the fused op - otherwise nothing was verified
+    bool require_observed = false;
 };
 
 static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
@@ -79,6 +91,69 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+// V3: the derived kq mask only changes the flash attention prefill path (the packed mask stays for
+// decode and small batches), so the probe is a prefill-shaped single sequence
+static const llm_fused_op_probe llm_fused_op_kq_derived_probe = {
+    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN_DERIVED,
+    /*.name             =*/ "derived kq mask flash attention",
+    /*.n_tokens_per_seq =*/ 64,
+    /*.n_seqs           =*/ 1,
+    /*.require_gpu      =*/ true,
+    /*.require_kq_derived =*/ true,
+    /*.require_observed =*/ true,
+};
+
+// the derived kq mask is implemented by the CUDA/HIP backend only - any other backend that accepts
+// the flash attention op would silently ignore the derived sources.  An iGPU (APU) is still the
+// CUDA/HIP backend, so it implements the derived path too (the MMA kernel is the same one).
+static bool ggml_backend_dev_is_cuda(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+
+    const auto type = ggml_backend_dev_type(dev);
+    if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        return false;
+    }
+
+    const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+
+    return name != nullptr && (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0);
+}
+
+// true when this build exposes the CUDA/HIP backend at all
+static bool ggml_backend_cuda_family_available() {
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        const char * name = ggml_backend_reg_name(ggml_backend_reg_get(i));
+
+        if (name != nullptr && (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// the derived kq mask is only implemented by the CUDA/HIP backend.  A "meta" device (the
+// tensor-parallel wrapper used for multi-GPU tensor split) does not expose its sub-devices here, but
+// its supports_op forwards to all of them - which is exactly how the probed node ended up on it - so
+// accepting it is only safe while this build has the CUDA/HIP backend that the check above enforces.
+static bool ggml_backend_dev_implements_kq_derived(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+
+    switch (ggml_backend_dev_type(dev)) {
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+            return ggml_backend_dev_is_cuda(dev);
+        case GGML_BACKEND_DEVICE_TYPE_META:
+            return ggml_backend_cuda_family_available();
+        default:
+            return false;
+    }
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -232,6 +307,19 @@ llama_context::llama_context(
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+
+    cparams.kq_mask_derived = true;
+    cparams.auto_kq_mask_derived = true;
+    {
+        const char * LLAMA_KQ_MASK_DERIVED = getenv("LLAMA_KQ_MASK_DERIVED");
+        if (LLAMA_KQ_MASK_DERIVED) {
+            // only an explicit 0 forces the packed mask - the probe below stays in charge of whether
+            // the backend can actually run the derived form
+            cparams.kq_mask_derived = atoi(LLAMA_KQ_MASK_DERIVED) != 0;
+            cparams.auto_kq_mask_derived = cparams.kq_mask_derived;
+            LLAMA_LOG_INFO("%s: derived kq mask = %d (env)\n", __func__, cparams.kq_mask_derived);
+        }
+    }
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
@@ -414,6 +502,10 @@ llama_context::llama_context(
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
+        // the graph builders that choose between quantized-aware attention arms need the same
+        // types the memory module was given (see qwen4exp_qsa_sparse)
+        cparams.type_k = params_mem.type_k;
+        cparams.type_v = params_mem.type_v;
 
         memory.reset(model.create_memory(params_mem, cparams));
     }
@@ -532,18 +624,22 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             return;
         }
 
-        const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs;
+        const uint32_t n_seqs_probe    = probe.n_seqs > 0 ? probe.n_seqs : n_seqs;
+        const uint32_t n_tokens_probe  = probe.n_tokens_per_seq*n_seqs_probe;
 
-        auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
+        auto * gf = graph_reserve(n_tokens_probe, n_seqs_probe, n_tokens_probe, mctx, true);
         if (!gf) {
             throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
         }
 
         bool device_mismatch = false;
+        bool observed = false;
         for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
             if (node.op != probe.op) {
                 continue;
             }
+
+            observed = true;
 
             GGML_ASSERT(node.il >= 0);
 
@@ -564,6 +660,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                 device_mismatch = true;
                 break;
             }
+
+            const auto device_fused_type = ggml_backend_dev_type(device_fused);
+
+            if (probe.require_gpu && device_fused_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    device_fused_type != GGML_BACKEND_DEVICE_TYPE_IGPU &&
+                    device_fused_type != GGML_BACKEND_DEVICE_TYPE_META) {
+                LLAMA_LOG_WARN("%s: %s is not supported on a CPU device\n", func, probe.name);
+                device_mismatch = true;
+                break;
+            }
+
+            if (probe.require_kq_derived && !ggml_backend_dev_implements_kq_derived(device_fused)) {
+                LLAMA_LOG_WARN("%s: %s is assigned to %s, but it is only implemented by the CUDA/HIP backend\n",
+                        func, probe.name,
+                        device_fused ? ggml_backend_dev_name(device_fused) : "none");
+                device_mismatch = true;
+                break;
+            }
+        }
+
+        if (!observed && probe.require_observed) {
+            LLAMA_LOG_WARN("%s: %s was not used in the probe graph, set to disabled\n", func, probe.name);
+            device_mismatch = true;
         }
 
         if (device_mismatch) {
@@ -578,6 +697,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     if (cparams.auto_fa) {
         resolve(llm_fused_op_flash_attn_probe, cparams.flash_attn);
         cparams.auto_fa = false;
+    }
+
+    // note: after the flash attention probe, so that cparams.flash_attn is already resolved
+    if (cparams.auto_kq_mask_derived) {
+        LLAMA_LOG_INFO("%s: resolving derived kq mask support:\n", func);
+        resolve(llm_fused_op_kq_derived_probe, cparams.kq_mask_derived);
+        cparams.auto_kq_mask_derived = false;
     }
 
     if (cparams.auto_fgdn) {
