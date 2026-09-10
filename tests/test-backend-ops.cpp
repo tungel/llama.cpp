@@ -7673,9 +7673,10 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    const bool derived; // V3: derive the mask in the kernel from cell_pos/tok_lo/tok_hi instead of a mask tensor
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) + VAR_TO_STR(derived);
     }
 
     double max_nmse_err() override {
@@ -7692,9 +7693,12 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool derived = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), derived(derived) {}
+
+    // V3: the derived form replaces the mask tensor; both are never used together.
+    bool mask_tensor() const { return mask && !derived; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7741,7 +7745,7 @@ struct test_flash_attn_ext : public test_case {
         ggml_set_name(v, "v");
 
         ggml_tensor * m = nullptr;
-        if (mask) {
+        if (mask_tensor()) {
             m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
         }
@@ -7754,6 +7758,18 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
+        if (derived) {
+            // V3 derived kq mask: the per-cell position (INT32_MIN marks an always-dropped cell) and
+            // the per-token inclusive visibility window [tok_lo, tok_hi].
+            GGML_ASSERT(n_kv_max == 0 && max_bias == 0.0f); // the derived form is dense-only and without ALiBi
+            ggml_tensor * cell_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
+            ggml_set_name(cell_pos, "cell_pos");
+            ggml_tensor * tok_lo = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
+            ggml_set_name(tok_lo, "tok_lo");
+            ggml_tensor * tok_hi = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
+            ggml_set_name(tok_hi, "tok_hi");
+            ggml_flash_attn_ext_add_kq_derived(out, cell_pos, tok_lo, tok_hi);
+        }
         ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
         ggml_prec_set_acc(out, prec);
         ggml_set_name(out, "out");
@@ -7771,6 +7787,20 @@ struct test_flash_attn_ext : public test_case {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
                 } else {
                     init_tensor_kq_mask(t);
+                }
+            } else if (strcmp(t->name, "cell_pos") == 0) {
+                // V3 derived kq mask: the cell's position, with every 16th cell "empty" (INT32_MIN).
+                int32_t * data = (int32_t *) t->data;
+                for (int64_t j = 0; j < t->ne[0]; ++j) {
+                    data[j] = j % 16 == 15 ? INT32_MIN : (int32_t) j;
+                }
+            } else if (strcmp(t->name, "tok_lo") == 0 || strcmp(t->name, "tok_hi") == 0) {
+                // V3 derived kq mask: a per-token sliding window over the cell positions, so that every
+                // token sees at least one cell but the visible sets differ per token.
+                const bool is_lo = strcmp(t->name, "tok_lo") == 0;
+                int32_t * data = (int32_t *) t->data;
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    data[i] = (int32_t) (is_lo ? (2*i*kv)/(2*nb) : ((i + 1)*kv)/nb);
                 }
             } else {
                 init_tensor_uniform(t);
@@ -7830,8 +7860,10 @@ struct test_flash_attn_qsa : public test_case {
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, 1);
         ggml_set_name(m, "m");
 
-        // softcap must be 0: the kernel's softcap arm is not implemented
-        ggml_tensor * out = ggml_flash_attn_qsa(ctx, q, k, v, idx, m, 1.0f/sqrtf((float) hsk), 0.0f);
+        // softcap must be 0: the kernel's softcap arm is not implemented.
+        // block 15 (memory campaign) adds the derived-visibility inputs; the mask path (this test)
+        // passes null for both, exactly like the model does when the mask is present.
+        ggml_tensor * out = ggml_flash_attn_qsa(ctx, q, k, v, idx, m, 1.0f/sqrtf((float) hsk), 0.0f, nullptr, nullptr);
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
 
@@ -10829,6 +10861,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // FLASH_ATTN_EXT MMA: non-pow2 head size and MLA K/V view.
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+
+    // FLASH_ATTN_EXT with the V3 derived kq mask: no mask tensor, the visibility is derived in the
+    // kernel from the cell positions and the per-token window.  The CPU reference implements the same
+    // form, so this compares the CUDA derived path against a real oracle.  nb > 32/ncols2 selects the
+    // MMA kernel (the only one that implements the derived form); kv covers a padded and a ragged K/V.
+    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 4096, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4090, 33, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 1024, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, true));
 
     // FLASH_ATTN_EXT MMA, swizzled K/V tiles, power-of-two stride: nbatch_K2 = 32, 64, 128, 256.
     test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 4096,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
